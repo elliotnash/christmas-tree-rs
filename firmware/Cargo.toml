@@ -16,7 +16,7 @@ experimental = ["esp-idf-svc/experimental"]
 [dependencies]
 common = { path = "../common" }
 
-# log = "0.4"
+log = "0.4"
 esp-idf-svc = "0.51"
 
 # NeoPixel libraries
