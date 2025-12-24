@@ -1,19 +1,17 @@
+use crate::messages::MessageHandler;
 use common::message::{LogPayload, Message};
-use esp_idf_svc::hal::uart::UartDriver;
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
-use std::sync::Mutex;
+use std::sync::Arc;
 
-/// Logger that sends log messages over serial UART
+/// Logger that sends log messages over serial UART using MessageHandler
 pub struct SerialLogger {
-    uart: Mutex<UartDriver<'static>>,
+    message_handler: Arc<MessageHandler>,
 }
 
 impl SerialLogger {
-    /// Create a new SerialLogger with a UART driver
-    pub fn new(uart: UartDriver<'static>) -> Self {
-        Self {
-            uart: Mutex::new(uart),
-        }
+    /// Create a new SerialLogger with a MessageHandler
+    pub fn new(message_handler: Arc<MessageHandler>) -> Self {
+        Self { message_handler }
     }
 
     /// Initialize the logger as the global logger
@@ -37,30 +35,14 @@ impl Log for SerialLogger {
             let payload = LogPayload::new(record.level(), content);
             let message = Message::Log(payload);
 
-            // Serialize the message
-            if let Ok(bytes) = message.to_bytes() {
-                // Write to UART - UartDriver implements esp_idf_svc::io::Write
-                if let Ok(mut uart) = self.uart.lock() {
-                    use esp_idf_svc::io::Write;
-                    // Write all bytes, handling partial writes
-                    let mut remaining = &bytes[..];
-                    while !remaining.is_empty() {
-                        match uart.write(remaining) {
-                            Ok(0) => break, // No progress, stop trying
-                            Ok(n) => remaining = &remaining[n..],
-                            Err(_) => break, // Error occurred, stop trying
-                        }
-                    }
-                }
-            }
+            // Send message through MessageHandler
+            // Ignore errors in logging to avoid infinite loops
+            let _ = self.message_handler.send(&message);
         }
     }
 
     fn flush(&self) {
-        // UART writes are typically immediate, but we can ensure flush if needed
-        if let Ok(mut uart) = self.uart.lock() {
-            use esp_idf_svc::io::Write;
-            let _ = uart.flush();
-        }
+        // MessageHandler handles flushing internally
+        // No additional action needed here
     }
 }

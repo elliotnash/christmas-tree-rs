@@ -15,6 +15,8 @@ experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
 common = { path = "../common" }
+cobs = { version = "0.5", features = ["serde"] }
+postcard = { version = "1.1", features = ["postcard-derive", "use-std"]}
 
 log = "0.4"
 esp-idf-svc = "0.51"
