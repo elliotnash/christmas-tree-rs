@@ -1,35 +1,30 @@
 pub mod logger;
 pub mod messages;
 
+use embassy_executor::Spawner;
 use esp_idf_svc::hal::gpio::{AnyIOPin, AnyInputPin};
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::uart::{UartConfig, UartDriver};
+use esp_idf_svc::hal::uart::{UartConfig, AsyncUartDriver};
 use esp_idf_svc::hal::units::Hertz;
 use smart_leds::{RGB8, SmartLedsWrite};
-use std::sync::Arc;
-use std::thread::sleep;
-use std::time::Duration;
 use ws2812_esp32_rmt_driver::driver::color::LedPixelColorGrb24;
 use ws2812_esp32_rmt_driver::LedPixelEsp32Rmt;
 use logger::SerialLogger;
-use messages::MessageHandler;
 use common::message::Message;
 
 const NUM_LEDS: usize = 513;
 
-fn main() -> ! {
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
-
-    // Bind the log crate to the ESP Logging facilities
-    // esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take().unwrap();
     
     // Create UART driver for UART1
     let uart_config = UartConfig::default().baudrate(Hertz(115_200));
-    let uart = UartDriver::new(
+    let uart = AsyncUartDriver::new(
         peripherals.uart1,
         peripherals.pins.gpio4,
         peripherals.pins.gpio3,
@@ -38,11 +33,14 @@ fn main() -> ! {
         &uart_config
     ).unwrap();
     
-    // Create MessageHandler for UART communication
-    let message_handler = Arc::new(MessageHandler::new(uart));
+    // Split UART into TX and RX components and spawn tasks
+    let uart = Box::leak(Box::new(uart));
+    let (tx, rx) = uart.split();
+    spawner.spawn(messages::tx_task(tx)).unwrap();
+    spawner.spawn(messages::rx_task(rx)).unwrap();
     
-    // Initialize logger with MessageHandler
-    SerialLogger::new(message_handler.clone()).init(log::LevelFilter::Info).unwrap();
+    // Initialize logger
+    SerialLogger::new().init(log::LevelFilter::Info).unwrap();
 
     log::info!("Initializing...");
     
@@ -58,17 +56,30 @@ fn main() -> ! {
 
     log::info!("System ready, entering main loop...");
 
-    // Main loop: continuously read messages from UART
+    // Get reference to log channel for processing log messages
+    let log_channel = logger::SerialLogger::channel();
+    let log_receiver = log_channel.receiver();
+    
+    // Get receivers/senders for UART channels
+    let rx_receiver = messages::RX_CHANNEL.receiver();
+    let tx_sender = messages::TX_CHANNEL.sender();
+
+    // Main loop: continuously read messages from channel and process log messages
     loop {
-        // Try to receive a message (non-blocking)
-        match message_handler.try_receive() {
-            Ok(Some(message)) => {
+        // Process log messages from channel (non-blocking) - send them to UART TX
+        while let Ok(log_message) = log_receiver.try_receive() {
+            let _ = tx_sender.try_send(log_message);
+        }
+
+        // Try to receive a message from UART (non-blocking)
+        match rx_receiver.try_receive() {
+            Ok(message) => {
                 // Handle received message
                 match message {
                     Message::Heartbeat => {
                         // Respond with heartbeat
                         log::info!("Received heartbeat for some reason {:?}", message);
-                        let _ = message_handler.send(&Message::Heartbeat);
+                        let _ = tx_sender.try_send(Message::Heartbeat);
                     }
                     Message::SetLeds(payload) => {
                         log::info!("Received SetLeds command with {} LEDs", payload.leds.len());
@@ -95,15 +106,12 @@ fn main() -> ! {
                     }
                 }
             }
-            Ok(None) => {
+            Err(embassy_sync::channel::TryReceiveError::Empty) => {
                 // No message available, continue
-            }
-            Err(e) => {
-                log::warn!("Error receiving message: {}", e);
             }
         }
         
         // Small delay to yield CPU time and prevent watchdog timeout
-        sleep(Duration::from_millis(10));
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
     }
 }

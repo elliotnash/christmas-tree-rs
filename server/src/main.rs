@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected! Starting main loop...");
 
     let mut red: u8 = 100;
+    let mut since_message: u8 = 0;
 
     // Main loop: continuously send and receive messages
     loop {
@@ -42,15 +43,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Small delay to avoid busy waiting
-        std::thread::sleep(Duration::from_millis(100));
-        if red >= 255 {
-            red = 0;
-        } else {
-            red += 1;
+        std::thread::sleep(Duration::from_millis(10));
+        since_message += 1;
+        if since_message >= 100 {
+            since_message = 0;
+            let message = Message::Heartbeat;
+            println!("Sending heartbeat");
+            message_handler.send(&message)?;
         }
-        // Send a SetLeds message with the red value
-        let pixels: Vec<Rgb> = std::iter::repeat(Rgb::new(red, 0, 0)).take(513).collect();
-        let message = Message::SetLeds(SetLedsPayload { leds: pixels });
-        message_handler.send(&message)?;
+        // if red >= 255 {
+        //     red = 0;
+        // } else {
+        //     red += 1;
+        // }
+        // // Send a SetLeds message with the red value
+        // let pixels: Vec<Rgb> = std::iter::repeat(Rgb::new(red, 0, 0)).take(513).collect();
+        // let message = Message::SetLeds(SetLedsPayload { leds: pixels });
+        // message_handler.send(&message)?;
     }
 }

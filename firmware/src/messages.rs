@@ -1,187 +1,133 @@
 use common::message::Message;
-use esp_idf_svc::hal::uart::UartDriver;
-use esp_idf_svc::io::Write;
-use postcard::to_allocvec;
-use std::sync::Mutex;
-use std::time::Duration;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_time;
+use esp_idf_svc::hal::uart::{UartTxDriver, UartRxDriver};
+use esp_idf_svc::io::asynch::Write;
 
 /// Frame delimiter byte (0x00) - COBS ensures this never appears in encoded data
 const FRAME_DELIMITER: u8 = 0x00;
 
-/// UART message handler for sending and receiving messages over UART1 using COBS framing
-pub struct MessageHandler {
-    uart: Mutex<UartDriver<'static>>,
-    receive_buffer: Mutex<Vec<u8>>,
-    last_read_time: Mutex<Option<std::time::Instant>>,
-}
+/// Channel sizes for messages
+const RX_CHANNEL_SIZE: usize = 16;
+const TX_CHANNEL_SIZE: usize = 16;
 
-impl MessageHandler {
-    /// Create a new MessageHandler with a UART driver
-    pub fn new(uart: UartDriver<'static>) -> Self {
-        Self {
-            uart: Mutex::new(uart),
-            receive_buffer: Mutex::new(Vec::new()),
-            last_read_time: Mutex::new(None),
-        }
-    }
+/// Static channels for messages
+pub static RX_CHANNEL: Channel<CriticalSectionRawMutex, Message, RX_CHANNEL_SIZE> = Channel::new();
+pub static TX_CHANNEL: Channel<CriticalSectionRawMutex, Message, TX_CHANNEL_SIZE> = Channel::new();
 
-    /// Send a message over UART using COBS encoding with frame delimiter
-    pub fn send(&self, message: &Message) -> Result<(), MessageError> {
-        // Serialize message to bytes using postcard
-        let serialized = to_allocvec(message)
-            .map_err(|e| MessageError::Serialization(format!("Postcard serialization error: {}", e)))?;
+/// UART TX task that continuously reads messages from TX_CHANNEL and sends them over UART1
+#[embassy_executor::task]
+pub async fn tx_task(
+    mut uart_tx: esp_idf_svc::hal::uart::AsyncUartTxDriver<'static, UartTxDriver<'static>>,
+) {
+    let receiver = TX_CHANNEL.receiver();
 
-        // Encode with COBS
-        let mut encoded = cobs::encode_vec(&serialized)
-            .map_err(|e| MessageError::Serialization(format!("COBS encoding error: {}", e)))?;
+    loop {
+        // Wait for a message to send
+        let message = receiver.receive().await;
 
-        // Append frame delimiter (byte 0)
-        encoded.push(FRAME_DELIMITER);
-
-        // Write to UART - handle partial writes
-        if let Ok(mut uart) = self.uart.lock() {
-            let mut remaining = &encoded[..];
-            while !remaining.is_empty() {
-                match uart.write(remaining) {
-                    Ok(0) => return Err(MessageError::WriteError("No progress on write".to_string())),
-                    Ok(n) => remaining = &remaining[n..],
-                    Err(e) => return Err(MessageError::WriteError(format!("UART write error: {:?}", e))),
-                }
-            }
-            uart.flush()
-                .map_err(|e| MessageError::WriteError(format!("UART flush error: {:?}", e)))?;
-            Ok(())
-        } else {
-            Err(MessageError::LockError)
-        }
-    }
-
-    /// Try to receive a message from UART
-    /// Returns Ok(Some(message)) if a complete frame was received (ending with byte 0)
-    /// Returns Ok(None) if no complete frame is available yet
-    /// Returns Err if an error occurred
-    pub fn try_receive(&self) -> Result<Option<Message>, MessageError> {
-        let mut new_bytes_received = false;
-
-        // Read from UART first (minimize lock time)
-        let bytes_read = {
-            if let Ok(mut uart) = self.uart.lock() {
-                let mut buffer = [0u8; 256];
-
-                // Read available bytes from UART (non-blocking)
-                match uart.read(&mut buffer, 0u32) {
-                    Ok(n) if n > 0 => {
-                        // Release UART lock quickly, copy data to return
-                        let mut data = vec![0u8; n];
-                        data.copy_from_slice(&buffer[..n]);
-                        new_bytes_received = true;
-                        Some(data)
-                    }
-                    Ok(_) => None, // No data available
-                    Err(_) => None, // No data available or error, continue to check buffer
-                }
-            } else {
-                return Err(MessageError::LockError);
+        // Serialize and COBS encode message (includes 0x00 delimiter at the end)
+        let encoded = match postcard::to_stdvec_cobs(&message) {
+            Ok(data) => data,
+            Err(_e) => {
+                // Skip invalid messages
+                continue;
             }
         };
 
-        // Append new data to receive buffer if any was read
-        if let Some(new_data) = bytes_read {
-            if let Ok(mut recv_buf) = self.receive_buffer.lock() {
-                recv_buf.extend_from_slice(&new_data);
-            } else {
-                return Err(MessageError::LockError);
+        // Write to UART - handle partial writes
+        let mut remaining = &encoded[..];
+        while !remaining.is_empty() {
+            match uart_tx.write(remaining).await {
+                Ok(0) => {
+                    // No progress on write, yield and retry
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
+                    continue;
+                }
+                Ok(n) => remaining = &remaining[n..],
+                Err(_e) => {
+                    // Write error, skip this message
+                    break;
+                }
             }
         }
 
-        // Update last read time if we received new bytes
-        if new_bytes_received {
-            if let Ok(mut last_read) = self.last_read_time.lock() {
-                *last_read = Some(std::time::Instant::now());
+        // Flush to ensure data is sent
+        let _ = uart_tx.flush().await;
+    }
+}
+
+/// UART RX task that continuously reads from UART and pushes complete messages to RX_CHANNEL
+#[embassy_executor::task]
+pub async fn rx_task(
+    uart_rx: esp_idf_svc::hal::uart::AsyncUartRxDriver<'static, UartRxDriver<'static>>,
+) {
+    let mut receive_buffer = Vec::new();
+
+    loop {
+        // Read from UART
+        let mut buffer = [0u8; 256];
+        match uart_rx.read(&mut buffer).await {
+            Ok(n) if n > 0 => {
+                // Append new data to receive buffer
+                receive_buffer.extend_from_slice(&buffer[..n]);
+            }
+            Ok(_) => {
+                // No data available, yield CPU time
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
+                continue;
+            }
+            Err(_) => {
+                // Error reading, continue
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
+                continue;
             }
         }
 
-        // Look for complete frame (ending with byte 0)
-        if let Ok(mut recv_buf) = self.receive_buffer.lock() {
-            if recv_buf.is_empty() {
-                return Ok(None);
+        // Look for complete frames (ending with byte 0)
+        loop {
+            if receive_buffer.is_empty() {
+                break;
             }
 
             // Find frame delimiter (byte 0)
-            if let Some(frame_end) = recv_buf.iter().position(|&b| b == FRAME_DELIMITER) {
-                // Found a complete frame
-                let frame_data = recv_buf[..frame_end].to_vec();
+            if let Some(frame_end) = receive_buffer.iter().position(|&b| b == FRAME_DELIMITER) {
+                // Found a potential complete frame (including delimiter at frame_end)
+                // Extract frame data (need mutable for from_bytes_cobs)
+                let mut frame_data = receive_buffer[..=frame_end].to_vec();
 
-                // Remove the frame (including delimiter) from buffer
-                recv_buf.drain(..=frame_end);
+                // Try to decode COBS and deserialize message
+                match postcard::from_bytes_cobs::<Message>(&mut frame_data) {
+                    Ok(message) => {
+                        // Success! Remove the frame (including delimiter) from buffer
+                        receive_buffer.drain(..=frame_end);
 
-                // Decode COBS
-                let decoded: Result<Vec<u8>, _> = cobs::decode_vec(&frame_data);
-                let decoded_bytes = decoded
-                    .map_err(|e| MessageError::DecodeError(format!("COBS decode error: {}", e)))?;
-
-                // Deserialize message
-                let message = Message::from_bytes(&decoded_bytes)
-                    .map_err(|e| MessageError::Deserialization(format!("Postcard deserialization error: {}", e)))?;
-
-                return Ok(Some(message));
-            } else {
-                // No complete frame yet
-                // If we haven't received any new bytes since last check, return None
-                // Otherwise, if buffer is getting too large, clear it to prevent memory issues
-                if recv_buf.len() > 4096 {
-                    recv_buf.clear();
-                    return Err(MessageError::BufferOverflow);
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Blocking receive that waits for a message
-    /// This will block until a complete message is received or timeout occurs
-    pub fn receive(&self, timeout: Duration) -> Result<Message, MessageError> {
-        let start = std::time::Instant::now();
-
-        loop {
-            match self.try_receive() {
-                Ok(Some(message)) => return Ok(message),
-                Ok(None) => {
-                    if start.elapsed() >= timeout {
-                        return Err(MessageError::Timeout);
+                        // Send message to RX channel (blocking until space is available)
+                        // This ensures messages are not lost
+                        let sender = RX_CHANNEL.sender();
+                        sender.send(message).await;
+                    }
+                    Err(_) => {
+                        // Deserialization failed - this might be corrupted data
+                        // Discard the first byte and continue searching for another delimiter
+                        if receive_buffer.len() > 1 {
+                            receive_buffer.remove(0);
+                            // Continue loop to look for another delimiter
+                        } else {
+                            receive_buffer.clear();
+                            break;
+                        }
                     }
                 }
-                Err(e) => return Err(e),
+            } else {
+                // No delimiter found - frame is incomplete
+                // If buffer is getting too large, clear it to prevent memory issues
+                if receive_buffer.len() > 4096 {
+                    receive_buffer.clear();
+                }
+                break;
             }
         }
     }
 }
-
-/// Errors that can occur when handling messages
-#[derive(Debug)]
-pub enum MessageError {
-    Serialization(String),
-    Deserialization(String),
-    DecodeError(String),
-    WriteError(String),
-    LockError,
-    Timeout,
-    BufferOverflow,
-}
-
-impl std::fmt::Display for MessageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MessageError::Serialization(e) => write!(f, "Serialization error: {}", e),
-            MessageError::Deserialization(e) => write!(f, "Deserialization error: {}", e),
-            MessageError::DecodeError(e) => write!(f, "COBS decode error: {}", e),
-            MessageError::WriteError(e) => write!(f, "Write error: {}", e),
-            MessageError::LockError => write!(f, "Failed to acquire lock"),
-            MessageError::Timeout => write!(f, "Receive timeout"),
-            MessageError::BufferOverflow => write!(f, "Receive buffer overflow"),
-        }
-    }
-}
-
-impl std::error::Error for MessageError {}

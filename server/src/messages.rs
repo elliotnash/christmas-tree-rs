@@ -1,5 +1,4 @@
 use common::message::Message;
-use postcard::to_allocvec;
 use serialport::SerialPort;
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -32,16 +31,11 @@ impl MessageHandler {
 
     /// Send a message over serial using COBS encoding with frame delimiter
     pub fn send(&self, message: &Message) -> Result<(), MessageError> {
-        // Serialize message to bytes using postcard
-        let serialized = to_allocvec(message)
-            .map_err(|e| MessageError::Serialization(format!("Postcard serialization error: {}", e)))?;
+        // Serialize and COBS encode message (includes 0x00 delimiter at the end)
+        let encoded = postcard::to_stdvec_cobs(message)
+            .map_err(|e| MessageError::Serialization(format!("Postcard COBS serialization error: {}", e)))?;
 
-        // Encode with COBS
-        let mut encoded = cobs::encode_vec(&serialized)
-            .map_err(|e| MessageError::Serialization(format!("COBS encoding error: {}", e)))?;
-
-        // Append frame delimiter (byte 0)
-        encoded.push(FRAME_DELIMITER);
+        println!("Sending message: {:?}", encoded);
 
         // Write to serial port - handle partial writes
         if let Ok(mut port) = self.port.lock() {
@@ -65,40 +59,48 @@ impl MessageHandler {
     /// Returns Ok(Some(message)) if a complete frame was received (ending with byte 0)
     /// Returns Ok(None) if no complete frame is available yet
     /// Returns Err if an error occurred
+    /// 
+    /// If bytes are received, continues reading until a complete frame is found or no more data is available
     pub fn try_receive(&self) -> Result<Option<Message>, MessageError> {
-        let mut new_bytes_received = false;
+        let mut any_bytes_received = false;
 
-        // Read from serial port
-        let bytes_read = {
-            if let Ok(mut port) = self.port.lock() {
-                let mut buffer = [0u8; 256];
+        // Keep reading until we have a complete frame or no more data is available
+        loop {
+            // Read from serial port
+            let bytes_read = {
+                if let Ok(mut port) = self.port.lock() {
+                    let mut buffer = [0u8; 256];
 
-                // Read available bytes from serial (non-blocking due to timeout)
-                match port.read(&mut buffer) {
-                    Ok(n) if n > 0 => {
-                        new_bytes_received = true;
-                        Some(buffer[..n].to_vec())
+                    // Read available bytes from serial (non-blocking due to timeout)
+                    match port.read(&mut buffer) {
+                        Ok(n) if n > 0 => {
+                            any_bytes_received = true;
+                            Some(buffer[..n].to_vec())
+                        }
+                        Ok(_) => None, // No data available
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => None, // No data available
+                        Err(e) => return Err(MessageError::ReadError(format!("Serial read error: {}", e))),
                     }
-                    Ok(_) => None, // No data available
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => None, // No data available
-                    Err(e) => return Err(MessageError::ReadError(format!("Serial read error: {}", e))),
+                } else {
+                    return Err(MessageError::LockError);
+                }
+            };
+
+            // Append new data to receive buffer if any was read
+            if let Some(new_data) = bytes_read {
+                if let Ok(mut recv_buf) = self.receive_buffer.lock() {
+                    recv_buf.extend_from_slice(&new_data);
+                } else {
+                    return Err(MessageError::LockError);
                 }
             } else {
-                return Err(MessageError::LockError);
-            }
-        };
-
-        // Append new data to receive buffer if any was read
-        if let Some(new_data) = bytes_read {
-            if let Ok(mut recv_buf) = self.receive_buffer.lock() {
-                recv_buf.extend_from_slice(&new_data);
-            } else {
-                return Err(MessageError::LockError);
+                // No more data available, break out of read loop
+                break;
             }
         }
 
-        // Update last read time if we received new bytes
-        if new_bytes_received {
+        // Update last read time if we received any bytes
+        if any_bytes_received {
             if let Ok(mut last_read) = self.last_read_time.lock() {
                 *last_read = Some(std::time::Instant::now());
             }
@@ -110,35 +112,54 @@ impl MessageHandler {
                 return Ok(None);
             }
 
-            // Find frame delimiter (byte 0)
-            if let Some(frame_end) = recv_buf.iter().position(|&b| b == FRAME_DELIMITER) {
-                // Found a complete frame
-                let frame_data = recv_buf[..frame_end].to_vec();
+            // Keep trying to find and decode valid frames
+            loop {
+                // Find frame delimiter (byte 0)
+                if let Some(frame_end) = recv_buf.iter().position(|&b| b == FRAME_DELIMITER) {
+                    // Found a potential complete frame (including delimiter at frame_end)
+                    // Extract frame data (need mutable for from_bytes_cobs)
+                    let mut frame_data = recv_buf[..=frame_end].to_vec();
 
-                // Remove the frame (including delimiter) from buffer
-                recv_buf.drain(..=frame_end);
-
-                // Decode COBS
-                let decoded: Result<Vec<u8>, _> = cobs::decode_vec(&frame_data);
-                let decoded_bytes = decoded
-                    .map_err(|e| MessageError::DecodeError(format!("COBS decode error: {}", e)))?;
-
-                // Deserialize message
-                let message = Message::from_bytes(&decoded_bytes)
-                    .map_err(|e| MessageError::Deserialization(format!("Postcard deserialization error: {}", e)))?;
-
-                return Ok(Some(message));
-            } else {
-                // No complete frame yet
-                // If buffer is getting too large, clear it to prevent memory issues
-                if recv_buf.len() > 4096 {
-                    recv_buf.clear();
-                    return Err(MessageError::BufferOverflow);
+                    // Try to decode COBS and deserialize message
+                    match postcard::from_bytes_cobs::<Message>(&mut frame_data) {
+                        Ok(message) => {
+                            // Success! Remove the frame (including delimiter) from buffer
+                            recv_buf.drain(..=frame_end);
+                            return Ok(Some(message));
+                        }
+                        Err(_) => {
+                            // Deserialization failed - this might be corrupted data
+                            // Discard the first byte and continue searching for another delimiter
+                            if recv_buf.len() > 1 {
+                                recv_buf.remove(0);
+                                // Continue loop to look for another delimiter
+                            } else {
+                                recv_buf.clear();
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // No delimiter found - frame is incomplete or buffer is empty
+                    // If buffer is getting too large, clear it to prevent memory issues
+                    if recv_buf.len() > 4096 {
+                        recv_buf.clear();
+                        return Err(MessageError::BufferOverflow);
+                    }
+                    break;
                 }
             }
         }
 
-        Ok(None)
+        // Only return None if we didn't receive any new bytes
+        // If we received bytes but no delimiter, the frame is incomplete
+        if any_bytes_received {
+            // We received bytes but no complete frame - wait for more data
+            Ok(None)
+        } else {
+            // No bytes received at all
+            Ok(None)
+        }
     }
 
     /// Blocking receive that waits for a message
@@ -167,7 +188,6 @@ impl MessageHandler {
 pub enum MessageError {
     Serialization(String),
     Deserialization(String),
-    DecodeError(String),
     WriteError(String),
     ReadError(String),
     PortError(String),
@@ -181,7 +201,6 @@ impl std::fmt::Display for MessageError {
         match self {
             MessageError::Serialization(e) => write!(f, "Serialization error: {}", e),
             MessageError::Deserialization(e) => write!(f, "Deserialization error: {}", e),
-            MessageError::DecodeError(e) => write!(f, "COBS decode error: {}", e),
             MessageError::WriteError(e) => write!(f, "Write error: {}", e),
             MessageError::ReadError(e) => write!(f, "Read error: {}", e),
             MessageError::PortError(e) => write!(f, "Port error: {}", e),

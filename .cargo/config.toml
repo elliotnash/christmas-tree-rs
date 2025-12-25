@@ -1,8 +1,10 @@
 [alias] 
 build-firmware = "build --package firmware --target riscv32imc-esp-espidf"
 run-firmware = "run --package firmware --target riscv32imc-esp-espidf"
+check-firmware = "check --package firmware --target riscv32imc-esp-espidf"
 build-server = "build --package server"
 run-server = "run --package server"
+check-server = "check --package server"
 
 [target.riscv32imc-esp-espidf]
 linker = "ldproxy"
