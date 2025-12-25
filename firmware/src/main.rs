@@ -4,6 +4,7 @@ pub mod messages;
 use embassy_executor::Spawner;
 use esp_idf_svc::hal::gpio::{AnyIOPin, AnyInputPin};
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::uart::config::EventConfig;
 use esp_idf_svc::hal::uart::{UartConfig, AsyncUartDriver};
 use esp_idf_svc::hal::units::Hertz;
 use smart_leds::{RGB8, SmartLedsWrite};
@@ -23,7 +24,9 @@ async fn main(spawner: Spawner) {
     let peripherals = Peripherals::take().unwrap();
     
     // Create UART driver for UART1
-    let uart_config = UartConfig::default().baudrate(Hertz(115_200));
+    let mut uart_config = UartConfig::default().baudrate(Hertz(115_200));
+    uart_config.event_config.rx_fifo_full = Some(1);
+    uart_config.event_config.receive_timeout = Some(1);
     let uart = AsyncUartDriver::new(
         peripherals.uart1,
         peripherals.pins.gpio4,

@@ -1,4 +1,5 @@
 use common::message::Message;
+use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time;
@@ -64,70 +65,86 @@ pub async fn rx_task(
     uart_rx: esp_idf_svc::hal::uart::AsyncUartRxDriver<'static, UartRxDriver<'static>>,
 ) {
     let mut receive_buffer = Vec::new();
+    // Use a small read buffer to read immediately when data arrives
+    // This prevents the UART driver from buffering too much data
+    let mut read_buffer = [0u8; 1];
 
     loop {
-        // Read from UART
-        let mut buffer = [0u8; 256];
-        match uart_rx.read(&mut buffer).await {
-            Ok(n) if n > 0 => {
-                // Append new data to receive buffer
-                receive_buffer.extend_from_slice(&buffer[..n]);
+        // Keep reading from UART until no more data is available
+        // Using a small buffer (1 byte) ensures we read immediately when data arrives
+        let mut bytes_read_this_cycle = false;
+        
+        loop {
+            match uart_rx.driver().read(&mut read_buffer, 0) {
+                Ok(n) if n > 0 => {
+                    // Append new data to receive buffer
+                    log::info!("Read byte: {}", read_buffer[0]);
+                    receive_buffer.push(read_buffer[0]);
+                    bytes_read_this_cycle = true;
+                    // Continue reading to get all available data immediately
+                }
+                Ok(_) => {
+                    // No data available, break out of read loop
+                    break;
+                }
+                Err(e) => {
+                    // Error reading, break out of read loop
+                    log::error!("Error reading from UART. {:?}", e);
+                    break;
+                }
             }
-            Ok(_) => {
-                // No data available, yield CPU time
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
-                continue;
-            }
-            Err(_) => {
-                // Error reading, continue
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
-                continue;
-            }
+            yield_now().await;
         }
 
-        // Look for complete frames (ending with byte 0)
-        loop {
-            if receive_buffer.is_empty() {
-                break;
-            }
+        // Process all complete frames in the buffer
+        // Only process if we read new data this cycle
+        if bytes_read_this_cycle {
+            loop {
+                if receive_buffer.is_empty() {
+                    break;
+                }
 
-            // Find frame delimiter (byte 0)
-            if let Some(frame_end) = receive_buffer.iter().position(|&b| b == FRAME_DELIMITER) {
-                // Found a potential complete frame (including delimiter at frame_end)
-                // Extract frame data (need mutable for from_bytes_cobs)
-                let mut frame_data = receive_buffer[..=frame_end].to_vec();
+                // Find frame delimiter (byte 0)
+                if let Some(frame_end) = receive_buffer.iter().position(|&b| b == FRAME_DELIMITER) {
+                    // Found a potential complete frame (including delimiter at frame_end)
+                    // Extract frame data (need mutable for from_bytes_cobs)
+                    let mut frame_data = receive_buffer[..=frame_end].to_vec();
 
-                // Try to decode COBS and deserialize message
-                match postcard::from_bytes_cobs::<Message>(&mut frame_data) {
-                    Ok(message) => {
-                        // Success! Remove the frame (including delimiter) from buffer
-                        receive_buffer.drain(..=frame_end);
+                    // Try to decode COBS and deserialize message
+                    match postcard::from_bytes_cobs::<Message>(&mut frame_data) {
+                        Ok(message) => {
+                            // Success! Remove the frame (including delimiter) from buffer
+                            receive_buffer.drain(..=frame_end);
 
-                        // Send message to RX channel (blocking until space is available)
-                        // This ensures messages are not lost
-                        let sender = RX_CHANNEL.sender();
-                        sender.send(message).await;
-                    }
-                    Err(_) => {
-                        // Deserialization failed - this might be corrupted data
-                        // Discard the first byte and continue searching for another delimiter
-                        if receive_buffer.len() > 1 {
-                            receive_buffer.remove(0);
-                            // Continue loop to look for another delimiter
-                        } else {
-                            receive_buffer.clear();
-                            break;
+                            // Send message to RX channel (blocking until space is available)
+                            // This ensures messages are not lost
+                            let sender = RX_CHANNEL.sender();
+                            sender.send(message).await;
+                        }
+                        Err(_) => {
+                            // Deserialization failed - this might be corrupted data
+                            // Discard the first byte and continue searching for another delimiter
+                            if receive_buffer.len() > 1 {
+                                receive_buffer.remove(0);
+                                // Continue loop to look for another delimiter
+                            } else {
+                                receive_buffer.clear();
+                                break;
+                            }
                         }
                     }
+                } else {
+                    // No delimiter found - frame is incomplete
+                    // If buffer is getting too large, clear it to prevent memory issues
+                    if receive_buffer.len() > 4096 {
+                        receive_buffer.clear();
+                    }
+                    break;
                 }
-            } else {
-                // No delimiter found - frame is incomplete
-                // If buffer is getting too large, clear it to prevent memory issues
-                if receive_buffer.len() > 4096 {
-                    receive_buffer.clear();
-                }
-                break;
             }
+        } else {
+            // No data was read, yield CPU time
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
         }
     }
 }
