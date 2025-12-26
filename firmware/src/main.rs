@@ -108,8 +108,7 @@ async fn main(spawner: Spawner) {
         match message {
             Message::Heartbeat => {
                 // Respond with heartbeat
-                log::info!("Received heartbeat for some reason {:?}", message);
-                let _ = message_sender.try_send(Message::Heartbeat);
+                message_sender.try_send(Message::Heartbeat).ok();
             }
             Message::SetLeds(payload) => {
                 log::info!("Received SetLeds command with {} LEDs", payload.leds.len());
