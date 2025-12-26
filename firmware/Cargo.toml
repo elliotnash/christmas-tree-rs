@@ -6,28 +6,43 @@ edition = "2024"
 
 [[bin]]
 name = "firmware"
-harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
-
-[features]
-default = []
-
-experimental = ["esp-idf-svc/experimental"]
+# harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
 
 [dependencies]
 common = { path = "../common" }
-postcard = { version = "1.1", features = ["postcard-derive", "use-std"]}
+postcard = { version = "1.1", features = ["postcard-derive", "alloc"]}
 
+esp-hal = { version = "~1.0", features = ["esp32c6", "log-04", "unstable"] }
+
+esp-rtos = { version = "0.2", features = [
+  "embassy",
+  "esp-alloc",
+  "esp32c6",
+  "log-04",
+] }
+
+esp-bootloader-esp-idf = { version = "0.4", features = ["esp32c6", "log-04"] }
 log = "0.4"
-esp-idf-svc = { version = "0.51", features = ["embassy-time-driver", "embassy-sync"] }
-embassy-executor = { version = "0.7", features = ["executor-thread", "arch-std"] }
-critical-section = { version = "1.1", features = ["std"], default-features = false }
+
+embassy-executor = { version = "0.9", features = ["log"] }
+embassy-time = { version = "0.5", features = ["log"] }
 embassy-sync = "0.7"
-embassy-time = "0.4"
 embassy-futures = "0.1"
+embedded-io-async = "0.7"
+esp-alloc = "0.9"
+esp-backtrace = { version = "0.18", features = [
+  "esp32c6",
+  "panic-handler",
+  "println",
+] }
+esp-println = { version = "0.16", features = ["esp32c6", "log-04"] }
+
+critical-section = "1.2"
+static_cell      = "2.1"
 
 # NeoPixel libraries
 smart-leds = "0.4"
-ws2812-esp32-rmt-driver = { version = "0.13", features = ["smart-leds-trait"] }
+esp-hal-smartled = "0.17"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }

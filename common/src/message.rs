@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
 use log::Level;
 
 /// RGB color value

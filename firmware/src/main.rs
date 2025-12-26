@@ -1,120 +1,139 @@
+#![no_std]
+#![no_main]
+#![deny(
+    clippy::mem_forget,
+    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
+    holding buffers for the duration of a data transfer."
+)]
+#![deny(clippy::large_stack_frames)]
+
 pub mod logger;
 pub mod messages;
 
 use embassy_executor::Spawner;
-use esp_idf_svc::hal::gpio::{AnyIOPin, AnyInputPin};
-use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::uart::config::EventConfig;
-use esp_idf_svc::hal::uart::{UartConfig, AsyncUartDriver};
-use esp_idf_svc::hal::units::Hertz;
-use smart_leds::{RGB8, SmartLedsWrite};
-use ws2812_esp32_rmt_driver::driver::color::LedPixelColorGrb24;
-use ws2812_esp32_rmt_driver::LedPixelEsp32Rmt;
-use logger::SerialLogger;
+use esp_backtrace as _;
+use esp_hal::time::Rate;
+use esp_hal::uart;
+use esp_hal::rmt::Rmt;
+use esp_hal::clock::CpuClock;
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::uart::{AtCmdConfig, RxConfig, Uart};
+use esp_hal_smartled::{SmartLedsAdapterAsync, buffer_size_async};
+use smart_leds::{RGB8, SmartLedsWriteAsync, gamma};
+// use logger::SerialLogger;
 use common::message::Message;
+use alloc::vec::Vec;
+
+use crate::messages::{FIFO_FULL_THRESHOLD, PACKET_DELIMITER};
+
+extern crate alloc;
+
 
 const NUM_LEDS: usize = 513;
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    // It is necessary to call this function once. Otherwise, some patches to the runtime
-    // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
-    esp_idf_svc::sys::link_patches();
+// This creates a default app-descriptor required by the esp-idf bootloader.
+// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
+esp_bootloader_esp_idf::esp_app_desc!();
 
-    let peripherals = Peripherals::take().unwrap();
+#[allow(
+    clippy::large_stack_frames,
+    reason = "it's not unusual to allocate larger buffers etc. in main"
+)]
+#[esp_rtos::main]
+async fn main(spawner: Spawner) {
+    esp_println::logger::init_logger_from_env();
+
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_interrupt =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+
+    log::info!("Embassy initialized!");
+
+
+    // Create RMT led driver
+    let rmt: Rmt<'_, esp_hal::Async> = Rmt::new(peripherals.RMT, Rate::from_mhz(80))
+        .expect("Failed to initialize RMT")
+        .into_async();
+
+    let rmt_channel = rmt.channel0;
+    let mut rmt_buffer = [esp_hal::rmt::PulseCode::default(); buffer_size_async(NUM_LEDS)];
+
+    let mut led_driver = SmartLedsAdapterAsync::new(rmt_channel, peripherals.GPIO10, &mut rmt_buffer);
+
+    // Clear LEDs
+    let pixels: Vec<RGB8> = core::iter::repeat(RGB8::new(0, 0, 0)).take(NUM_LEDS).collect();
+    if let Err(e) = led_driver.write(pixels).await {
+        log::error!("Failed to write LEDs: {:?}", e);
+    }
+
+    log::info!("RMT led driver initialized");
+
     
-    // Create UART driver for UART1
-    let mut uart_config = UartConfig::default().baudrate(Hertz(115_200));
-    uart_config.event_config.rx_fifo_full = Some(1);
-    uart_config.event_config.receive_timeout = Some(1);
-    let uart = AsyncUartDriver::new(
-        peripherals.uart1,
-        peripherals.pins.gpio4,
-        peripherals.pins.gpio3,
-        Option::<AnyInputPin>::None,
-        Option::<AnyIOPin>::None,
-        &uart_config
-    ).unwrap();
-    
-    // Split UART into TX and RX components and spawn tasks
-    let uart = Box::leak(Box::new(uart));
-    let (tx, rx) = uart.split();
+    // Create UART driver for UART0
+    let config = uart::Config::default()
+        .with_rx(RxConfig::default().with_fifo_full_threshold(FIFO_FULL_THRESHOLD as u16));
+
+    let mut uart0 = Uart::new(peripherals.UART0, config)
+        .expect("Failed to initialize UART")
+        .into_async();
+    uart0.set_at_cmd(AtCmdConfig::default().with_cmd_char(PACKET_DELIMITER));
+
+    let (rx, tx) = uart0.split();
+
+    log::info!("UART driver initialized");
+
+    // Start embassy tasks to send and receive messages over UART
     spawner.spawn(messages::tx_task(tx)).unwrap();
     spawner.spawn(messages::rx_task(rx)).unwrap();
     
     // Initialize logger
-    SerialLogger::new().init(log::LevelFilter::Info).unwrap();
+    // SerialLogger::new().init(log::LevelFilter::Info).unwrap();
 
-    log::info!("Initializing...");
-    
-    let led_pin = peripherals.pins.gpio10;
-    let channel = peripherals.rmt.channel0;
-    let mut led_driver = LedPixelEsp32Rmt::<RGB8, LedPixelColorGrb24>::new(channel, led_pin).unwrap();
-
-    // Clear LEDs
-    let pixels: Vec<RGB8> = std::iter::repeat(RGB8::new(0, 0, 0)).take(NUM_LEDS).collect();
-    if let Err(err) = led_driver.write(pixels) {
-        log::error!("Failed to clear LEDs: {:?}", err);
-    }
-
-    log::info!("System ready, entering main loop...");
-
-    // Get reference to log channel for processing log messages
-    let log_channel = logger::SerialLogger::channel();
-    let log_receiver = log_channel.receiver();
+    log::info!("System initialized, entering main loop...");
     
     // Get receivers/senders for UART channels
-    let rx_receiver = messages::RX_CHANNEL.receiver();
-    let tx_sender = messages::TX_CHANNEL.sender();
+    let message_receiver = messages::RX_CHANNEL.receiver();
+    let message_sender = messages::TX_CHANNEL.sender();
 
     // Main loop: continuously read messages from channel and process log messages
     loop {
-        // Process log messages from channel (non-blocking) - send them to UART TX
-        while let Ok(log_message) = log_receiver.try_receive() {
-            let _ = tx_sender.try_send(log_message);
-        }
-
         // Try to receive a message from UART (non-blocking)
-        match rx_receiver.try_receive() {
-            Ok(message) => {
-                // Handle received message
-                match message {
-                    Message::Heartbeat => {
-                        // Respond with heartbeat
-                        log::info!("Received heartbeat for some reason {:?}", message);
-                        let _ = tx_sender.try_send(Message::Heartbeat);
+        let message = message_receiver.receive().await;
+        match message {
+            Message::Heartbeat => {
+                // Respond with heartbeat
+                log::info!("Received heartbeat for some reason {:?}", message);
+                let _ = message_sender.try_send(Message::Heartbeat);
+            }
+            Message::SetLeds(payload) => {
+                log::info!("Received SetLeds command with {} LEDs", payload.leds.len());
+                // Convert RGB values to RGB8 and write to LEDs
+                let pixels: Vec<RGB8> = gamma(payload.leds
+                    .iter()
+                    .map(|rgb| RGB8 {
+                        r: rgb.r,
+                        g: rgb.g,
+                        b: rgb.b,
+                    }))
+                    .collect();
+                
+                if pixels.len() == NUM_LEDS {
+                    if let Err(e) = led_driver.write(pixels).await {
+                        log::error!("Failed to write LEDs: {:?}", e);
                     }
-                    Message::SetLeds(payload) => {
-                        log::info!("Received SetLeds command with {} LEDs", payload.leds.len());
-                        // Convert RGB values to RGB8 and write to LEDs
-                        let pixels: Vec<RGB8> = payload.leds
-                            .iter()
-                            .map(|rgb| RGB8 {
-                                r: rgb.r,
-                                g: rgb.g,
-                                b: rgb.b,
-                            })
-                            .collect();
-                        
-                        if pixels.len() == NUM_LEDS {
-                            if let Err(e) = led_driver.write(pixels) {
-                                log::error!("Failed to write LEDs: {:?}", e);
-                            }
-                        } else {
-                            log::warn!("Received {} LEDs, expected {}", pixels.len(), NUM_LEDS);
-                        }
-                    }
-                    msg => {
-                        log::warn!("Received unexpected message: {:?}", msg);
-                    }
+                } else {
+                    log::warn!("Received {} LEDs, expected {}", pixels.len(), NUM_LEDS);
                 }
             }
-            Err(embassy_sync::channel::TryReceiveError::Empty) => {
-                // No message available, continue
+            msg => {
+                log::warn!("Received unexpected message: {:?}", msg);
             }
         }
-        
-        // Small delay to yield CPU time and prevent watchdog timeout
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
     }
 }

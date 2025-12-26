@@ -2,9 +2,17 @@
 resolver = "3"
 members = ["common","firmware", "server"]
 
-[profile.release]
+# TODO: Make sure these only apply to firmware, not the server
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
 opt-level = "s"
 
-[profile.dev]
-debug = true    # Symbols are nice, and they don't increase the size on Flash
-opt-level = "z"
+[profile.release]
+codegen-units    = 1     # LLVM can perform better optimizations using a single thread
+debug            = 2
+debug-assertions = false
+incremental      = false
+lto              = 'fat'
+opt-level        = 's'
+overflow-checks  = false

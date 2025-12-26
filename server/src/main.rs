@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting to serial port /dev/ttyS3 at 115200 baud...");
     
     // Create message handler connected to /dev/ttyS3 at 115200 baud
-    let message_handler = MessageHandler::new("/dev/ttyS3", 115200)?;
+    let message_handler = MessageHandler::new("/dev/ttyACM0", 115200)?;
     
     println!("Connected! Starting main loop...");
 

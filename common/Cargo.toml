@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-postcard = { version = "1.1", features = ["postcard-derive", "use-std"]}
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.1", features = ["postcard-derive"]}
 log = "0.4"
