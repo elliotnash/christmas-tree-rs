@@ -1,7 +1,7 @@
 [alias] 
-build-firmware = "build --package firmware --target riscv32imac-unknown-none-elf"
-run-firmware = "run --package firmware --target riscv32imac-unknown-none-elf"
-check-firmware = "check --package firmware --target riscv32imac-unknown-none-elf"
+build-firmware = "build -Z build-std=alloc,core --package firmware --target riscv32imac-unknown-none-elf"
+run-firmware = "run -Z build-std=alloc,core --package firmware --target riscv32imac-unknown-none-elf"
+check-firmware = "check -Z build-std=alloc,core --package firmware --target riscv32imac-unknown-none-elf"
 build-server = "build --package server"
 run-server = "run --package server"
 check-server = "check --package server"
@@ -19,6 +19,3 @@ rustflags = [
   # NOTE: May negatively impact performance of produced code
   "-C", "force-frame-pointers",
 ]
-
-[unstable]
-build-std = ["alloc", "core"]
